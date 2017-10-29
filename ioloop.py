@@ -47,167 +47,175 @@ class EventHandler:
 				conn 	= ioloop.open_connection( clusterconfig.getaddr(msg.nodeid) )
 				if len(conn.outbound_packets) == 0:
 					ioloop.mod_connection(conn, select.EPOLLOUT)
-				conn.outbound_packets.append( Packet('paxo%04d%s' % ( len(msg.data), msg.data) ) )
+				conn.outbound_packets.append( Packet( msg.data ) )
 				logging.debug('move outbound queue to conn.outbound_packets. nodeid:%d msg:%s', msg.nodeid, msg.data)
 		except Queue.Empty as e:
 			logging.debug('outbound queue empty now. %s', str(e))
 
 	def on_event(self, ioloop, events):
-		if not events and ioloop.nodeid == 0:
-			logging.debug('event handler. try to connect nodeid:%d', 1)
-			ioloop.send_message(1, 'hello world! from node:%d'%(ioloop.nodeid))
+		if not events and ioloop.nodeid > 0:
+			logging.debug('event handler. try to connect nodeid:%d', 0)
+			ioloop.send_message(0, 'hello world! from node:%d'%(ioloop.nodeid))
 			self.sent=True
 		else:
 			pass
 	
 	def next_timeout(self):
-		return 5
+		return 0.001
 
-class AcceptHandler:
-	def __init(self):
-		pass
-	def accept(self, ioloop, conn):	
-		cli_sock, addr = conn.sock.accept()
-		logging.debug('connect from %s fd:%d', str(addr), cli_sock.fileno())
-		ioloop.add_connection( Connection(cli_sock, addr) )
-
-class ByteHandler:
+class ErrorHandler:
 	def __init__(self):
 		pass
-	def egress(self, ioloop, conn):
-		pass
-	def ingress(self, ioloop, conn):
-		pass
-
-class IOHandler:
-	IO_CONTINUE	= 0
-	IO_DONE		= 1
-	IO_CLOSE	= 2
-	def __init__(self):
-		pass
-	def error(self, ioloop, conn):
+	def on_error(self, ioloop, conn):
 		logging.debug('hang up event fd:%d', conn.fd)
 		ioloop.close_connection( conn )
 
-	def egress(self, ioloop, conn):
+class ProtocolHandler:
+	DONE 		= 0
+	CONTINUE 	= 1
+	PAUSE		= 2
+	CLOSE		= 3
+	def __init__(self):
+		pass
+	def on_read(self, buffer, packet):
+		data, start = buffer
+
+		phase, ret = packet.parse(data, start)
+		if phase == Packet.PHASE_ERROR:
+			# packet invalid
+			logging.debug('invalid packet:[%s]', packet.header)
+			return (ProtocolHandler.CLOSE, ret)
+		elif phase == Packet.PHASE_DONE:
+			# full packet
+			logging.debug('full packet:[%s]', packet.tostring())
+			return (ProtocolHandler.CONTINUE, ret)
+		else:
+			# half packet
+			logging.debug('half packet:[%s]', packet.tostring())
+			return (ProtocolHandler.PAUSE, ret)
+
+	def on_write(self, packets, data):
+		writeout = 0
+		while len( packets ) > 0:
+			# TODO: buffer capacity check
+			packet 	= packets.popleft()
+			part	= packet.tostring()
+			data.extend( part )
+			writeout += len( part )
+		return (ProtocolHandler.DONE, writeout)
+
+class TransportHandler:
+	IO_CONTINUE = 0
+	IO_DONE		= 1
+	IO_CLOSE	= 2
+	def __init__(self, protocol):
+		self.protocol = protocol
+		pass
+	def accept( self, ioloop, conn ):
+		cli_sock, addr = conn.sock.accept()
+		logging.debug( 'connect from %s fd:%d', str(addr), cli_sock.fileno() )
+		ioloop.add_connection( Connection( cli_sock, addr ) )
+
+
+	def egress( self, ioloop, conn ):
 		if conn.status == Connection.CONNECTING:
 			logging.debug('connect established. %s', str(conn))
 			conn.status = Connection.ESTABLISHED
-		if not conn.egress_packet:
-			if len( conn.outbound_packets ) == 0:
-				ioloop.mod_connection( conn, select.EPOLLIN )
-			else:
-				conn.egress_packet = conn.outbound_packets.popleft()
-		phase = IOHandler.IO_CLOSE
+		if not conn.writable():
+			ioloop.mod_connection( conn, select.EPOLLIN )
+
+		self.protocol.on_write( conn.outbound_packets, conn.outbound_bytes )
+
+		phase = TransportHandler.IO_CLOSE
 		try:
-			phase = self.send( conn.sock, conn.egress_packet )
+			# TODO: use ringbuffer
+			sent = self.send( conn.sock, conn.outbound_bytes )
+			conn.outbound_bytes = conn.outbound_bytes[sent:]
+			if conn.writable():
+				phase = TransportHandler.IO_CONTINUE
+			else:
+			 	phase = TransportHandler.IO_DONE
 		except IOError as e:
-			logging.debug('packet send error: %s', str(e))
+			logging.debug('bytes send error: %s', str(e))
 		
-		if phase == IOHandler.IO_CLOSE:
+		if phase == TransportHandler.IO_CLOSE:
 			ioloop.close_connection( conn )
 			logging.debug('connection closed')
-		elif phase == IOHandler.IO_DONE:
-			conn.egress_packet = None
-			if len( conn.outbound_packets ) == 0:
-				ioloop.mod_connection( conn, select.EPOLLIN )
-				logging.debug('no more packets to send')
+		elif phase == TransportHandler.IO_DONE:
+			ioloop.mod_connection( conn, select.EPOLLIN )
+			logging.debug('no more bytes to send')
 
-	def send(self, sock, packet):
-		while packet.work_len < packet.length:
-			self.sendbytes(sock, packet, packet.length)
+	def send(self, sock, data):
+		sendlen		= 0
+		totallen 	= len(data)
 
-		if packet.work_len >= packet.length:
-			logging.debug('packet sent. len:%d data:%s', packet.work_len, packet.data)
-			return IOHandler.IO_DONE
-		return IOHandler.IO_CONTINUE
-
-	def sendbytes(self, sock, packet, n):
-		writelen = 0
-		while packet.work_len < n:
-			data = packet.data[packet.work_len:]
-			ret = 0
+		while sendlen < totallen:
+			part	=	data[sendlen:]
 			try:
-				ret = sock.send(data)
+				sendlen += sock.send( part )
 			except socket.error as e:
-				logging.debug('send sock error: %s', str(e))
-			packet.work_len += len(data)
-			writelen		+= len(data)
-			if len( data ) == 0:
+				logging.debug('send bytes sock error: %s bytes:%s', str(e), part)
 				break
-		return writelen
+		return sendlen
 
 	def ingress(self, ioloop, conn):
 		if conn.status == Connection.CONNECTING:
 			conn.status = Connection.ESTABLISHED
-		if not conn.ingress_packet:
-			conn.ingress_packet = Packet()
-		phase = IOHandler.IO_CLOSE
 
+		phase 	= TransportHandler.IO_CLOSE
+		recvlen = 0
 		try:
-			phase = self.receive( conn.sock, conn.ingress_packet )
+			recvlen = self.receive( conn.sock, conn.inbound_bytes )
 		except IOError as e :
-			logging.debug('packet invalid : %s', str(e))
+			logging.debug('ingress bytes invalid : %s', str(e))
 
-		if phase == IOHandler.IO_CLOSE:
+		if recvlen != 0:
+			start, end = 0, len( conn.inbound_bytes )
+			readin = 0
+			while start < end:
+				ret, readin = self.protocol.on_read( (conn.inbound_bytes, start), conn.parsing_packet )
+				start += readin
+				if ret == ProtocolHandler.CLOSE:
+					break
+				elif ret == ProtocolHandler.PAUSE:
+					phase = TransportHandler.IO_CONTINUE
+					break
+				elif ret == ProtocolHandler.CONTINUE:
+					conn.inbound_packets.append( conn.parsing_packet )
+					ioloop.received_packets+=1
+					logging.debug('ioloop.received_packets:%d', ioloop.received_packets)
+					conn.parsing_packet = Packet()
+					phase = TransportHandler.IO_CONTINUE
+				else:
+					logging.debug('protocol return unknown phase')
+					break
+
+			if readin > 0:
+				conn.inbound_bytes = conn.inbound_bytes[readin:]	
+
+		if phase == TransportHandler.IO_CLOSE:
 			ioloop.close_connection( conn )
-			logging.debug('connection closed')
-		elif phase == IOHandler.IO_DONE:
-			pkg = conn.ingress_packet
-			logging.debug('packet received. magic:%s len:%d data:%s', pkg.magic, pkg.length, pkg.data)
-			conn.inbound_packets.append(pkg)
-			conn.ingress_packet = None
-	
-	def receive( self, sock, packet ):
-		previous_len = packet.work_len
 
-		if packet.phase == Packet.PHASE_MAGIC:
-			# READ MAGIC FIELD
-			self.readbytes( sock, packet, Packet.MAGIC_BYTES )
-			if packet.work_len == Packet.MAGIC_BYTES:
-				packet.phase = Packet.PHASE_LENGTH
-				packet.magic = packet.data
-				packet.data  = ''
-
-		if packet.phase == Packet.PHASE_LENGTH:
-			# READ LENGTH FIELD
-			self.readbytes( sock, packet, Packet.HEADER_BYTES )
-			if packet.work_len == Packet.HEADER_BYTES:
-				packet.phase = Packet.PHASE_DATA
-				packet.length= int(packet.data)
-				packet.data  = ''
-
-		if packet.phase == Packet.PHASE_DATA:
-			# READ DATA FIELD
-			self.readbytes( sock, packet, packet.length + Packet.HEADER_BYTES )
-			if packet.length == len(packet.data):
-				packet.phase = Packet.PHASE_DONE
-				return IOHandler.IO_DONE
-		# CONNECTION CLOSED
-		if previous_len == packet.work_len:
-			return IOHandler.IO_CLOSE
-		return IOHandler.IO_CONTINUE
-
-	def readbytes(self, sock, packet, n):
+	def receive( self, sock, data ):
 		readlen = 0
-		while packet.work_len < n:
-			data = ''
+		STEP = 1024
+		while True:
+			part = ''
 			try:
-				data = sock.recv(n - packet.work_len)
+				part = sock.recv( STEP )
 			except socket.error as e:
 				logging.debug('fd %d read sock error: %s', sock.fileno(), str(e))
-			packet.work_len += len(data)
-			readlen			+= len(data)
-			packet.data 	+= data
-			if len( data ) == 0:
+			readlen	+= len( part )
+			data.extend( part )
+			if len( part ) < STEP:
 				break
 		return readlen
 
 class Packet:
-	PHASE_MAGIC		= 1
-	PHASE_LENGTH	= 2
-	PHASE_DATA		= 3
-	PHASE_DONE		= 4
+	PHASE_HEADER	= 1
+	PHASE_DATA		= 2
+	PHASE_DONE		= 3
+	PHASE_ERROR		= 4
 
 	MAGIC_BYTES 	= 4
 	LENGTH_BYTES 	= 4
@@ -216,22 +224,58 @@ class Packet:
 	def __init__(self, data = ''):
 		self.reset()
 		self.data 	= data
+		self.header = ''
 		self.length = len( data )
 
 	def reset(self):
-		self.phase		= Packet.PHASE_MAGIC
+		self.phase		= Packet.PHASE_HEADER
 		self.magic		= ''
 		self.length		= 0
 		self.data 		= ''
 		self.work_len 	= 0
 
+	def tostring(self):
+		return 'paxo%04d%s' % ( len( self.data ), self.data )
+
+	def parse(self, data, start = 0):
+		end = len(data)
+		bufflen = end - start
+		readin = 0
+		if self.phase == Packet.PHASE_HEADER:
+			if bufflen + len( self.header ) < Packet.HEADER_BYTES:
+				self.header += data[start:]
+				return (self.phase, bufflen)
+			else:
+				readin = Packet.HEADER_BYTES - len( self.header )
+				self.header += data[ start : start + readin ]
+				self.magic 	= self.header[ : Packet.MAGIC_BYTES ]
+				if not self.header[ Packet.MAGIC_BYTES: ].isdigit():
+					return ( Packet.PHASE_ERROR, readin )
+				else:
+					self.length	= int( self.header[ Packet.MAGIC_BYTES : ] )
+				self.phase = Packet.PHASE_DATA
+				start 	+= readin
+				bufflen -= readin
+
+		if self.phase == Packet.PHASE_DATA:	
+			remain = self.length - len( self.data )
+			if bufflen >= remain :
+				readin += remain
+				self.data += data[ start : start + remain ]
+				self.phase = Packet.PHASE_DONE
+			else:
+				self.data += data[ start : ]
+				readin += bufflen
+			return (self.phase, readin)
+		return (Packet.PHASE_DONE, 0)
 
 class Connection:
 	CONNECTING	= 0
 	ESTABLISHED = 1
 	def __init__(self, sock, addr = None, blocking = False):
-		self.ingress_packet		= None
-		self.egress_packet		= None
+		self.parsing_packet		= Packet()
+		self.inbound_bytes		= bytearray()
+		self.outbound_bytes		= bytearray()
 		self.inbound_packets	= collections.deque()
 		self.outbound_packets	= collections.deque()
 		self.sock 				= sock
@@ -239,6 +283,8 @@ class Connection:
 		self.status				= Connection.CONNECTING
 		self.addr				= addr # peer addr
 		sock.setblocking(blocking)
+	def writable(self):
+		return len( self.outbound_bytes ) or len( self.outbound_packets )
 	def close(self):
 		if self.sock:
 			self.sock.close()
@@ -248,6 +294,9 @@ class Connection:
 
 class IOLoop:
 	def __init__(self):
+		self.received_packets 	= 0
+		self.sent_packets		= 0
+		self.next_connid 	= 0
 		self.listen_conn	= None
 		self.notify_poll	= None
 		self.notify_send	= None
@@ -255,9 +304,8 @@ class IOLoop:
 		self.nodeid			= 0
 		self.epoll			= None
 		self.fd2conn 		= {}
-		self.addr2fd		= {}
-		self.iohandler 		= IOHandler()
-		self.accepthandler 	= AcceptHandler()
+		self.addr2conn		= {}
+		self.iohandler 		= TransportHandler(ProtocolHandler())
 		self.eventhandler	= EventHandler()
 		self.inbound_queue	= Queue.Queue()
 		self.outbound_queue = Queue.Queue()
@@ -287,6 +335,7 @@ class IOLoop:
 		self.notify()
 
 	def notify(self):
+		# need lock
 		if not self.notify_flag:
 			self.notify_send.sock.send('1')
 			self.notify_flag = True
@@ -302,7 +351,7 @@ class IOLoop:
 						self.eventhandler.on_notify(self)
 						continue
 					if self.listen_conn.fd == fd:
-						self.accepthandler.accept(self, conn)
+						self.iohandler.accept(self, conn)
 						continue
 					if event & select.EPOLLHUP:
 						self.iohandler.error(self, conn)
@@ -319,23 +368,21 @@ class IOLoop:
 		self.epoll.close()
 
 	def close_connection(self, conn):
+		logging.debug('closing connection.')
 		self.epoll.unregister( conn.fd )
 		self.fd2conn[ conn.fd ].close()
 		del self.fd2conn[ conn.fd ]
-		if conn.addr in self.addr2fd and self.addr2fd[ conn.addr ] == conn.fd:
-			del self.addr2fd[ conn.addr ]
-		else:
-			logging.warning('conn.addr:%s not in mapping or fd not match', str(conn.addr))
+		del self.addr2conn[ conn.addr ]
 			
 	def add_connection(self, conn, EVENTS = select.EPOLLIN):
 		conn.sock.setblocking( False )
-		self.fd2conn[ conn.fd ] = conn
-		self.addr2fd[ conn.addr ] = conn.fd
+		self.fd2conn[ conn.fd ] 	= conn
+		self.addr2conn[ conn.addr ] = conn
 		self.epoll.register( conn.fd, EVENTS )
 
 	def open_connection(self, addrkey, EVENTS = select.EPOLLOUT):
-		if addrkey in self.addr2fd and self.addr2fd[addrkey] in self.fd2conn:
-			return self.fd2conn[ self.addr2fd[ addrkey ] ]
+		if addrkey in self.addr2conn:
+			return self.addr2conn[ addrkey ]
 			
 		sock = socket.socket( socket.AF_INET, socket.SOCK_STREAM )
 		sock.setblocking( False )
