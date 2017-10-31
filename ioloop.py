@@ -6,56 +6,34 @@ import collections
 import logging
 import sys
 import Queue
+import clusterconfig
 
 logging.basicConfig( format='%(asctime)-15s %(message)s', level=logging.DEBUG )
 
-class ClusterConfig:
-	addrs = {
-			0 : ('127.0.0.1', 20000),
-			1 : ('127.0.0.1', 20001),
-			2 : ('127.0.0.1', 20002),
-			3 : ('127.0.0.1', 20003),
-			4 : ('127.0.0.1', 20004),
-			5 : ('127.0.0.1', 20005),
-			6 : ('127.0.0.1', 20006),
-		}
-
-	def __init__(self):
-		pass
-	def getaddr(self, nodeid):
-		return ClusterConfig.addrs[nodeid]
-
-clusterconfig = ClusterConfig()
-
-class Message:
-	def __init__(self, nodeid, data = ''):
-		self.nodeid 	= nodeid
-		self.data 		= data
-		self.type		= 0
+clusterconfig = clusterconfig.ClusterConfig()
 
 class EventHandler:
 	def __init__(self):
 		self.sent = False
 		pass
 	def on_notify(self, ioloop):
-		msg = ioloop.notify_poll.sock.recv(1)
-		logging.debug('on_notify received dummy message:%s', msg)
+		ioloop.notify_poll.sock.recv(1)
 		ioloop.notify_flag = False
 		try:
 			while True:
-				msg 	= ioloop.outbound_queue.get_nowait()
-				conn 	= ioloop.open_connection( clusterconfig.getaddr(msg.nodeid) )
-				if len(conn.outbound_packets) == 0:
-					ioloop.mod_connection(conn, select.EPOLLOUT)
-				conn.outbound_packets.append( Packet( msg.data ) )
-				logging.debug('move outbound queue to conn.outbound_packets. nodeid:%d msg:%s', msg.nodeid, msg.data)
+				pkg 	= ioloop.outbound_queue.get_nowait()
+				conn 	= None
+				conn 	= ioloop.open_connection( clusterconfig.getaddr(pkg.nodeid) )
+				ioloop.mod_connection(conn, select.EPOLLOUT)
+				conn.outbound_packets.append( pkg )
 		except Queue.Empty as e:
-			logging.debug('outbound queue empty now. %s', str(e))
+			pass
+			# logging.debug('outbound queue empty now. %s', str(e))
 
 	def on_event(self, ioloop, events):
 		if not events and ioloop.nodeid > 0:
 			logging.debug('event handler. try to connect nodeid:%d', 0)
-			ioloop.send_message(0, 'hello world! from node:%d'%(ioloop.nodeid))
+			ioloop.send_message( Packet(0, 0, 0, 'hello world! from node:%d'%(ioloop.nodeid)))
 			self.sent=True
 		else:
 			pass
@@ -87,11 +65,11 @@ class ProtocolHandler:
 			return (ProtocolHandler.CLOSE, ret)
 		elif phase == Packet.PHASE_DONE:
 			# full packet
-			logging.debug('full packet:[%s]', packet.tostring())
+			# logging.debug('full packet:[%s]', packet.tostring())
 			return (ProtocolHandler.CONTINUE, ret)
 		else:
 			# half packet
-			logging.debug('half packet:[%s]', packet.tostring())
+			# logging.debug('half packet:[%s]', packet.tostring())
 			return (ProtocolHandler.PAUSE, ret)
 
 	def on_write(self, packets, data):
@@ -181,7 +159,7 @@ class TransportHandler:
 					phase = TransportHandler.IO_CONTINUE
 					break
 				elif ret == ProtocolHandler.CONTINUE:
-					conn.inbound_packets.append( conn.parsing_packet )
+					#conn.inbound_packets.append( conn.parsing_packet )
 					ioloop.received_packets+=1
 					logging.debug('ioloop.received_packets:%d', ioloop.received_packets)
 					conn.parsing_packet = Packet()
@@ -219,23 +197,41 @@ class Packet:
 
 	MAGIC_BYTES 	= 4
 	LENGTH_BYTES 	= 4
-	HEADER_BYTES 	= MAGIC_BYTES + LENGTH_BYTES
+	GROUP_BYTES		= 4
+	TYPE_BYTES		= 4
+	HEADER_BYTES 	= MAGIC_BYTES + LENGTH_BYTES + GROUP_BYTES + TYPE_BYTES
 
-	def __init__(self, data = ''):
+	def __init__(self, nodeid = 0, group = 0, type = 0, data = ''):
 		self.reset()
-		self.data 	= data
-		self.header = ''
-		self.length = len( data )
+		self.data 		= data
+		self.length 	= len( data )
+		self.group 		= group
+		self.type		= type
+		self.nodeid		= nodeid
 
 	def reset(self):
 		self.phase		= Packet.PHASE_HEADER
+		self.header 	= ''
 		self.magic		= ''
 		self.length		= 0
 		self.data 		= ''
 		self.work_len 	= 0
+		self.group 		= 0
+		self.type		= 0
 
 	def tostring(self):
-		return 'paxo%04d%s' % ( len( self.data ), self.data )
+		return 'paxo%04d%04d%04d%s' % ( len( self.data ), self.group, self.type, self.data )
+
+	def parse_int(self, data):
+		value = 0
+		if not data.isdigit():
+			return -1
+		else:
+			try:
+				value = int( data )
+			except ValueError as e:
+				return -1
+		return value
 
 	def parse(self, data, start = 0):
 		end = len(data)
@@ -248,11 +244,17 @@ class Packet:
 			else:
 				readin = Packet.HEADER_BYTES - len( self.header )
 				self.header += data[ start : start + readin ]
+				offset = 0
 				self.magic 	= self.header[ : Packet.MAGIC_BYTES ]
-				if not self.header[ Packet.MAGIC_BYTES: ].isdigit():
+				offset += Packet.MAGIC_BYTES
+				self.length	= self.parse_int( self.header[ offset: offset + Packet.LENGTH_BYTES] )
+				offset += Packet.LENGTH_BYTES
+				self.group	= self.parse_int( self.header[ offset: offset + Packet.GROUP_BYTES] )
+				offset += Packet.GROUP_BYTES
+				self.type   = self.parse_int( self.header[ offset: ])
+				if self.length < 0 or self.group < 0 or self.type < 0 :
 					return ( Packet.PHASE_ERROR, readin )
-				else:
-					self.length	= int( self.header[ Packet.MAGIC_BYTES : ] )
+
 				self.phase = Packet.PHASE_DATA
 				start 	+= readin
 				bufflen -= readin
@@ -293,7 +295,7 @@ class Connection:
 		return 'fd:%d' % (self.fd)
 
 class IOLoop:
-	def __init__(self):
+	def __init__(self, inbound_que = Queue.Queue(), outbound_que = Queue.Queue()):
 		self.received_packets 	= 0
 		self.sent_packets		= 0
 		self.next_connid 	= 0
@@ -307,31 +309,32 @@ class IOLoop:
 		self.addr2conn		= {}
 		self.iohandler 		= TransportHandler(ProtocolHandler())
 		self.eventhandler	= EventHandler()
-		self.inbound_queue	= Queue.Queue()
-		self.outbound_queue = Queue.Queue()
+		self.inbound_queue	= inbound_que
+		self.outbound_queue = outbound_que
 		pass
 
-	def start(self, nodeid = 0, backlog = 10 ):
+	def start(self, nodeid = 0, backlog = 10, svr_addr = None ):
 		self.nodeid 	= nodeid
 		self.epoll 		= select.epoll()
-		sock 			= socket.socket( socket.AF_INET, socket.SOCK_STREAM )
-		sock.setsockopt( socket.SOL_SOCKET, socket.SO_REUSEADDR, 1 )
-		svr_addr = clusterconfig.getaddr(nodeid)
-		sock.bind( svr_addr )
-		sock.listen( backlog )
+		if svr_addr:
+			sock 			= socket.socket( socket.AF_INET, socket.SOCK_STREAM )
+			sock.setsockopt( socket.SOL_SOCKET, socket.SO_REUSEADDR, 1 )
+			sock.bind( svr_addr )
+			sock.listen( backlog )
+			logging.debug("[node-%02d] server listen @ %s", nodeid, str(svr_addr))
+			self.listen_conn = Connection(sock)
+			self.add_connection( self.listen_conn )
+
 		(s1, s2) = socket.socketpair()
 		self.notify_poll = Connection(s1)
 		self.notify_send = Connection(s2)
-		logging.debug("listen_fd:%d notify_poll_fd:%d notify_send_fd:%d", sock.fileno(), s1.fileno(), s2.fileno())	
+		logging.debug("notify_poll_fd:%d notify_send_fd:%d", s1.fileno(), s2.fileno())	
 		self.add_connection( self.notify_poll )	
 
-		logging.debug("[node-%02d] server listen @ %s", nodeid, str(svr_addr))
-		self.listen_conn = Connection(sock)
-		self.add_connection( self.listen_conn )
 		self.loop()
 
-	def send_message(self, nodeid, data):
-		self.outbound_queue.put(Message(nodeid, data))
+	def send_message(self, pkg):
+		self.outbound_queue.put(pkg)
 		self.notify()
 
 	def notify(self):
@@ -347,14 +350,14 @@ class IOLoop:
 			if events:
 				for fd, event in events:
 					conn	= self.fd2conn[fd]
-					if self.notify_poll.fd == fd:
+					if self.notify_poll and self.notify_poll.fd == fd:
 						self.eventhandler.on_notify(self)
 						continue
-					if self.listen_conn.fd == fd:
+					if self.listen_conn and self.listen_conn.fd == fd:
 						self.iohandler.accept(self, conn)
 						continue
 					if event & select.EPOLLHUP:
-						self.iohandler.error(self, conn)
+						#self.iohandler.error(self, conn)
 						continue
 					if event & select.EPOLLIN:
 						self.iohandler.ingress(self, conn)
@@ -400,7 +403,8 @@ class IOLoop:
 
 if __name__ == '__main__':
 	loop = IOLoop()
-	if len( sys.argv ) <= 2:
-		loop.start( nodeid = int(sys.argv[1]) )
-	else:
-		loop.start()
+	if len( sys.argv ) == 2:
+		nodeid = int(sys.argv[1])
+		addr = clusterconfig.getaddr( nodeid )
+		logging.debug('nodeid:%d addr:%s', nodeid, str(addr))
+		loop.start( nodeid = nodeid, svr_addr = addr )
