@@ -7,6 +7,7 @@ import logging
 import sys
 import Queue
 import clusterconfig
+from packet import Packet
 
 logging.basicConfig( format='%(asctime)-15s %(message)s', level=logging.DEBUG )
 
@@ -188,88 +189,6 @@ class TransportHandler:
 			if len( part ) < STEP:
 				break
 		return readlen
-
-class Packet:
-	PHASE_HEADER	= 1
-	PHASE_DATA		= 2
-	PHASE_DONE		= 3
-	PHASE_ERROR		= 4
-
-	MAGIC_BYTES 	= 4
-	LENGTH_BYTES 	= 4
-	GROUP_BYTES		= 4
-	TYPE_BYTES		= 4
-	HEADER_BYTES 	= MAGIC_BYTES + LENGTH_BYTES + GROUP_BYTES + TYPE_BYTES
-
-	def __init__(self, nodeid = 0, group = 0, type = 0, data = ''):
-		self.reset()
-		self.data 		= data
-		self.length 	= len( data )
-		self.group 		= group
-		self.type		= type
-		self.nodeid		= nodeid
-
-	def reset(self):
-		self.phase		= Packet.PHASE_HEADER
-		self.header 	= ''
-		self.magic		= ''
-		self.length		= 0
-		self.data 		= ''
-		self.work_len 	= 0
-		self.group 		= 0
-		self.type		= 0
-
-	def tostring(self):
-		return 'paxo%04d%04d%04d%s' % ( len( self.data ), self.group, self.type, self.data )
-
-	def parse_int(self, data):
-		value = 0
-		if not data.isdigit():
-			return -1
-		else:
-			try:
-				value = int( data )
-			except ValueError as e:
-				return -1
-		return value
-
-	def parse(self, data, start = 0):
-		end = len(data)
-		bufflen = end - start
-		readin = 0
-		if self.phase == Packet.PHASE_HEADER:
-			if bufflen + len( self.header ) < Packet.HEADER_BYTES:
-				self.header += data[start:]
-				return (self.phase, bufflen)
-			else:
-				readin = Packet.HEADER_BYTES - len( self.header )
-				self.header += data[ start : start + readin ]
-				offset = 0
-				self.magic 	= self.header[ : Packet.MAGIC_BYTES ]
-				offset += Packet.MAGIC_BYTES
-				self.length	= self.parse_int( self.header[ offset: offset + Packet.LENGTH_BYTES] )
-				offset += Packet.LENGTH_BYTES
-				self.group	= self.parse_int( self.header[ offset: offset + Packet.GROUP_BYTES] )
-				offset += Packet.GROUP_BYTES
-				self.type   = self.parse_int( self.header[ offset: ])
-				if self.length < 0 or self.group < 0 or self.type < 0 :
-					return ( Packet.PHASE_ERROR, readin )
-
-				self.phase = Packet.PHASE_DATA
-				start 	+= readin
-				bufflen -= readin
-
-		if self.phase == Packet.PHASE_DATA:	
-			remain = self.length - len( self.data )
-			if bufflen >= remain :
-				readin += remain
-				self.data += data[ start : start + remain ]
-				self.phase = Packet.PHASE_DONE
-			else:
-				self.data += data[ start : ]
-				readin += bufflen
-			return (self.phase, readin)
-		return (Packet.PHASE_DONE, 0)
 
 class Connection:
 	CONNECTING	= 0
